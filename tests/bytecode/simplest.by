@@ -1,0 +1,16 @@
+
+
+set $r1 0 // fib1
+set $r2 1 // fib2
+set $r3 0 // counter
+loop:
+    add $r1 $r2
+    set $r1 $r2
+    set $r2 $ac
+
+    add $r3 1
+    cmp $r3 10
+    cjp :loop
+
+debug_regs
+hlt
