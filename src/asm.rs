@@ -1,88 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
-use std::error::Error;
-use std::fmt::{Display, Formatter};
+
+use anyhow::{Result, anyhow, bail};
+use miette::{LabeledSpan, NamedSource, miette};
 
 use crate::instruction::{Instruction, OpCode, Operand};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AsmError {
-    InvalidLabel {
-        line: usize,
-        label: String,
-    },
-    DuplicateLabel {
-        line: usize,
-        label: String,
-    },
-    EmptyInstruction {
-        line: usize,
-    },
-    UnknownOpcode {
-        line: usize,
-        opcode: String,
-    },
-    WrongOperandCount {
-        line: usize,
-        opcode: &'static str,
-        expected: usize,
-        actual: usize,
-    },
-    InvalidOperand {
-        line: usize,
-        operand: String,
-    },
-    DestinationMustBeRegister {
-        line: usize,
-    },
-    JumpTargetMustBeImmediateOrLabel {
-        line: usize,
-    },
-    UnknownLabel {
-        line: usize,
-        label: String,
-    },
-}
-
-impl Display for AsmError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidLabel { line, label } => {
-                write!(f, "line {line}: invalid label `{label}`")
-            }
-            Self::DuplicateLabel { line, label } => {
-                write!(f, "line {line}: duplicate label `{label}`")
-            }
-            Self::EmptyInstruction { line } => write!(f, "line {line}: empty instruction"),
-            Self::UnknownOpcode { line, opcode } => {
-                write!(f, "line {line}: unknown opcode `{opcode}`")
-            }
-            Self::WrongOperandCount {
-                line,
-                opcode,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "line {line}: opcode `{opcode}` expects {expected} operands, got {actual}"
-            ),
-            Self::InvalidOperand { line, operand } => {
-                write!(f, "line {line}: invalid operand `{operand}`")
-            }
-            Self::DestinationMustBeRegister { line } => {
-                write!(f, "line {line}: destination operand must be a register")
-            }
-            Self::JumpTargetMustBeImmediateOrLabel { line } => write!(
-                f,
-                "line {line}: jump target must be an immediate address or label"
-            ),
-            Self::UnknownLabel { line, label } => {
-                write!(f, "line {line}: unknown label `{label}`")
-            }
-        }
-    }
-}
-
-impl Error for AsmError {}
 
 #[derive(Debug, Clone)]
 struct ParsedInstruction {
@@ -98,7 +19,14 @@ enum OperandToken {
     Label(String),
 }
 
-pub fn assemble_program(source: &str) -> Result<Vec<Instruction>, AsmError> {
+pub fn assemble_program(source: &str) -> Result<Vec<Instruction>> {
+    assemble_program_with_context("<memory>", source).map_err(|error| anyhow!("{error}"))
+}
+
+pub fn assemble_program_with_context(
+    source_name: &str,
+    source: &str,
+) -> miette::Result<Vec<Instruction>> {
     let mut labels = HashMap::<String, usize>::new();
     let mut parsed = Vec::<ParsedInstruction>::new();
     let mut in_block_comment = false;
@@ -122,16 +50,24 @@ pub fn assemble_program(source: &str) -> Result<Vec<Instruction>, AsmError> {
 
             let label = label_token.trim_end_matches(':');
             if !is_valid_label(label) {
-                return Err(AsmError::InvalidLabel {
+                return Err(asm_diagnostic(
+                    source_name,
+                    source,
                     line,
-                    label: label.to_string(),
-                });
+                    &format!("line {line}: invalid label `{label}`"),
+                    Some("invalid label"),
+                    Some(label),
+                ));
             }
             if labels.insert(label.to_string(), parsed.len()).is_some() {
-                return Err(AsmError::DuplicateLabel {
+                return Err(asm_diagnostic(
+                    source_name,
+                    source,
                     line,
-                    label: label.to_string(),
-                });
+                    &format!("line {line}: duplicate label `{label}`"),
+                    Some("duplicate label"),
+                    Some(label),
+                ));
             }
 
             content = content[label_token.len()..].trim_start();
@@ -144,13 +80,39 @@ pub fn assemble_program(source: &str) -> Result<Vec<Instruction>, AsmError> {
             continue;
         }
 
-        parsed.push(parse_instruction(content, line)?);
+        let instruction = parse_instruction(content, line).map_err(|error| {
+            let message = error.to_string();
+            let highlight = extract_backticked_token(&message);
+            asm_diagnostic(
+                source_name,
+                source,
+                line,
+                &message,
+                Some("invalid instruction"),
+                highlight.as_deref(),
+            )
+        })?;
+        parsed.push(instruction);
     }
 
-    parsed
-        .iter()
-        .map(|instruction| lower_instruction(instruction, &labels))
-        .collect()
+    let mut program = Vec::with_capacity(parsed.len());
+    for instruction in &parsed {
+        let lowered = lower_instruction(instruction, &labels).map_err(|error| {
+            let message = error.to_string();
+            let highlight = extract_backticked_token(&message);
+            asm_diagnostic(
+                source_name,
+                source,
+                instruction.line,
+                &message,
+                Some("invalid operand or target"),
+                highlight.as_deref(),
+            )
+        })?;
+        program.push(lowered);
+    }
+
+    Ok(program)
 }
 
 pub fn disassemble_program(program: &[Instruction]) -> String {
@@ -167,9 +129,11 @@ pub fn disassemble_program(program: &[Instruction]) -> String {
     lines.join("\n")
 }
 
-fn parse_instruction(content: &str, line: usize) -> Result<ParsedInstruction, AsmError> {
+fn parse_instruction(content: &str, line: usize) -> Result<ParsedInstruction> {
     let mut parts = content.splitn(2, char::is_whitespace);
-    let mnemonic = parts.next().ok_or(AsmError::EmptyInstruction { line })?;
+    let mnemonic = parts
+        .next()
+        .ok_or_else(|| anyhow!("line {line}: empty instruction"))?;
     let operand_str = parts.next().unwrap_or("").trim();
 
     let (opcode, opcode_name, expected) = match mnemonic.to_ascii_lowercase().as_str() {
@@ -187,10 +151,7 @@ fn parse_instruction(content: &str, line: usize) -> Result<ParsedInstruction, As
         "move" => (OpCode::Move, "move", 2),
         "halt" => (OpCode::Halt, "halt", 0),
         _ => {
-            return Err(AsmError::UnknownOpcode {
-                line,
-                opcode: mnemonic.to_string(),
-            });
+            bail!("line {line}: unknown opcode `{mnemonic}`");
         }
     };
 
@@ -204,12 +165,10 @@ fn parse_instruction(content: &str, line: usize) -> Result<ParsedInstruction, As
     };
 
     if operands.len() != expected {
-        return Err(AsmError::WrongOperandCount {
-            line,
-            opcode: opcode_name,
-            expected,
-            actual: operands.len(),
-        });
+        bail!(
+            "line {line}: opcode `{opcode_name}` expects {expected} operands, got {}",
+            operands.len()
+        );
     }
 
     Ok(ParsedInstruction {
@@ -219,19 +178,15 @@ fn parse_instruction(content: &str, line: usize) -> Result<ParsedInstruction, As
     })
 }
 
-fn parse_operand_token(token: &str, line: usize) -> Result<OperandToken, AsmError> {
+fn parse_operand_token(token: &str, line: usize) -> Result<OperandToken> {
     if token.is_empty() {
-        return Err(AsmError::InvalidOperand {
-            line,
-            operand: token.to_string(),
-        });
+        bail!("line {line}: invalid operand `{token}`");
     }
 
     if let Some(register) = token.strip_prefix('r') {
-        let value = register.parse::<u64>().map_err(|_| AsmError::InvalidOperand {
-            line,
-            operand: token.to_string(),
-        })?;
+        let value = register
+            .parse::<u64>()
+            .map_err(|_| anyhow!("line {line}: invalid operand `{token}`"))?;
         return Ok(OperandToken::Register(value));
     }
 
@@ -243,16 +198,13 @@ fn parse_operand_token(token: &str, line: usize) -> Result<OperandToken, AsmErro
         return Ok(OperandToken::Label(token.to_string()));
     }
 
-    Err(AsmError::InvalidOperand {
-        line,
-        operand: token.to_string(),
-    })
+    bail!("line {line}: invalid operand `{token}`")
 }
 
 fn lower_instruction(
     parsed: &ParsedInstruction,
     labels: &HashMap<String, usize>,
-) -> Result<Instruction, AsmError> {
+) -> Result<Instruction> {
     let mut operands = [Operand::Register(0); 4];
 
     for (idx, token) in parsed.operands.iter().enumerate() {
@@ -270,7 +222,7 @@ fn lower_operand(
     idx: usize,
     token: &OperandToken,
     labels: &HashMap<String, usize>,
-) -> Result<Operand, AsmError> {
+) -> Result<Operand> {
     let is_destination = matches!(
         parsed.opcode,
         OpCode::Add
@@ -288,7 +240,7 @@ fn lower_operand(
     if is_destination {
         return match token {
             OperandToken::Register(reg) => Ok(Operand::Register(*reg)),
-            _ => Err(AsmError::DestinationMustBeRegister { line: parsed.line }),
+            _ => bail!("line {}: destination operand must be a register", parsed.line),
         };
     }
 
@@ -299,26 +251,22 @@ fn lower_operand(
         return match token {
             OperandToken::Immediate(value) => Ok(Operand::Immediate(*value)),
             OperandToken::Label(label) => {
-                let target =
-                    labels
-                        .get(label)
-                        .ok_or_else(|| AsmError::UnknownLabel {
-                            line: parsed.line,
-                            label: label.clone(),
-                        })?;
+                let target = labels
+                    .get(label)
+                    .ok_or_else(|| anyhow!("line {}: unknown label `{label}`", parsed.line))?;
                 Ok(Operand::Immediate(*target as u64))
             }
-            _ => Err(AsmError::JumpTargetMustBeImmediateOrLabel { line: parsed.line }),
+            _ => bail!(
+                "line {}: jump target must be an immediate address or label",
+                parsed.line
+            ),
         };
     }
 
     match token {
         OperandToken::Register(value) => Ok(Operand::Register(*value)),
         OperandToken::Immediate(value) => Ok(Operand::Immediate(*value)),
-        OperandToken::Label(label) => Err(AsmError::UnknownLabel {
-            line: parsed.line,
-            label: label.clone(),
-        }),
+        OperandToken::Label(label) => bail!("line {}: unknown label `{label}`", parsed.line),
     }
 }
 
@@ -486,6 +434,67 @@ fn strip_comments(line: &str, in_block_comment: &mut bool) -> String {
     out
 }
 
+fn asm_diagnostic(
+    source_name: &str,
+    source: &str,
+    line: usize,
+    message: &str,
+    label: Option<&str>,
+    highlight: Option<&str>,
+) -> miette::Report {
+    let (offset, len) = line_span(source, line, highlight);
+    let mut labels = Vec::new();
+    if let Some(text) = label {
+        labels.push(LabeledSpan::at((offset, len), text));
+    }
+
+    miette!(labels = labels, "{message}")
+        .with_source_code(NamedSource::new(source_name.to_string(), source.to_string()))
+}
+
+fn line_span(source: &str, line: usize, highlight: Option<&str>) -> (usize, usize) {
+    if line == 0 {
+        return (0, source.len().max(1));
+    }
+
+    let mut start = 0usize;
+    let mut current = 1usize;
+    for segment in source.split_inclusive('\n') {
+        if current == line {
+            let line_content = segment.trim_end_matches('\n');
+            if let Some(target) = highlight {
+                if !target.is_empty() {
+                    if let Some(column) = line_content.find(target) {
+                        return (start + column, target.len().max(1));
+                    }
+                }
+            }
+            let len = line_content.len().max(1);
+            return (start, len);
+        }
+        start += segment.len();
+        current += 1;
+    }
+
+    if current == line {
+        return (start, 1);
+    }
+
+    (source.len().saturating_sub(1), 1)
+}
+
+fn extract_backticked_token(message: &str) -> Option<String> {
+    let start = message.find('`')?;
+    let rest = &message[start + 1..];
+    let end = rest.find('`')?;
+    let token = &rest[..end];
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,7 +521,7 @@ done:
     fn assemble_rejects_unknown_label() {
         let src = "jump missing";
         let error = assemble_program(src).expect_err("should fail");
-        assert!(matches!(error, AsmError::UnknownLabel { .. }));
+        assert!(error.to_string().contains("unknown label `missing`"));
     }
 
     #[test]

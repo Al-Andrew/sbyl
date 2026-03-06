@@ -1,4 +1,5 @@
 use crate::instruction::{Instruction, OpCode, Operand};
+use anyhow::{Result, bail};
 
 #[derive(Debug)]
 pub struct Vm {
@@ -39,22 +40,22 @@ impl Vm {
         self.registers[reg] = value;
     }
 
-    fn destination(operand: Operand) -> usize {
+    fn destination(operand: Operand, pc: usize, opcode: OpCode) -> Result<usize> {
         match operand {
-            Operand::Register(reg) => reg as usize,
-            Operand::Immediate(value) => {
-                panic!("destination operand must be register, got immediate {value}")
-            }
+            Operand::Register(reg) => Ok(reg as usize),
+            Operand::Immediate(value) => bail!(
+                "vm runtime error at pc {pc} ({opcode:?}): destination operand must be register, got immediate {value}"
+            ),
         }
     }
 
-    pub fn step(&mut self) {
+    pub fn step(&mut self) -> Result<()> {
         if self.halted {
-            return;
+            return Ok(());
         }
         if self.pc >= self.program.len() {
             self.halted = true;
-            return;
+            return Ok(());
         }
 
         let instruction = self.program[self.pc];
@@ -62,58 +63,58 @@ impl Vm {
 
         match instruction.opcode {
             OpCode::Add => {
-                let dst = Self::destination(instruction.operands[0]);
+                let dst = Self::destination(instruction.operands[0], self.pc, instruction.opcode)?;
                 let lhs = self.read_operand(instruction.operands[1]);
                 let rhs = self.read_operand(instruction.operands[2]);
                 self.write_register(dst, lhs.wrapping_add(rhs));
             }
             OpCode::Sub => {
-                let dst = Self::destination(instruction.operands[0]);
+                let dst = Self::destination(instruction.operands[0], self.pc, instruction.opcode)?;
                 let lhs = self.read_operand(instruction.operands[1]);
                 let rhs = self.read_operand(instruction.operands[2]);
                 self.write_register(dst, lhs.wrapping_sub(rhs));
             }
             OpCode::Mul => {
-                let dst = Self::destination(instruction.operands[0]);
+                let dst = Self::destination(instruction.operands[0], self.pc, instruction.opcode)?;
                 let lhs = self.read_operand(instruction.operands[1]);
                 let rhs = self.read_operand(instruction.operands[2]);
                 self.write_register(dst, lhs.wrapping_mul(rhs));
             }
             OpCode::Div => {
-                let dst = Self::destination(instruction.operands[0]);
+                let dst = Self::destination(instruction.operands[0], self.pc, instruction.opcode)?;
                 let lhs = self.read_operand(instruction.operands[1]);
                 let rhs = self.read_operand(instruction.operands[2]);
                 if rhs == 0 {
-                    panic!("division by zero at pc {}", self.pc);
+                    bail!("vm runtime error at pc {} (Div): division by zero", self.pc);
                 }
                 self.write_register(dst, lhs / rhs);
             }
             OpCode::Eq => {
-                let dst = Self::destination(instruction.operands[0]);
+                let dst = Self::destination(instruction.operands[0], self.pc, instruction.opcode)?;
                 let lhs = self.read_operand(instruction.operands[1]);
                 let rhs = self.read_operand(instruction.operands[2]);
                 self.write_register(dst, u64::from(lhs == rhs));
             }
             OpCode::Gt => {
-                let dst = Self::destination(instruction.operands[0]);
+                let dst = Self::destination(instruction.operands[0], self.pc, instruction.opcode)?;
                 let lhs = self.read_operand(instruction.operands[1]);
                 let rhs = self.read_operand(instruction.operands[2]);
                 self.write_register(dst, u64::from(lhs > rhs));
             }
             OpCode::Lt => {
-                let dst = Self::destination(instruction.operands[0]);
+                let dst = Self::destination(instruction.operands[0], self.pc, instruction.opcode)?;
                 let lhs = self.read_operand(instruction.operands[1]);
                 let rhs = self.read_operand(instruction.operands[2]);
                 self.write_register(dst, u64::from(lhs < rhs));
             }
             OpCode::Gte => {
-                let dst = Self::destination(instruction.operands[0]);
+                let dst = Self::destination(instruction.operands[0], self.pc, instruction.opcode)?;
                 let lhs = self.read_operand(instruction.operands[1]);
                 let rhs = self.read_operand(instruction.operands[2]);
                 self.write_register(dst, u64::from(lhs >= rhs));
             }
             OpCode::Lte => {
-                let dst = Self::destination(instruction.operands[0]);
+                let dst = Self::destination(instruction.operands[0], self.pc, instruction.opcode)?;
                 let lhs = self.read_operand(instruction.operands[1]);
                 let rhs = self.read_operand(instruction.operands[2]);
                 self.write_register(dst, u64::from(lhs <= rhs));
@@ -132,7 +133,7 @@ impl Vm {
                 }
             }
             OpCode::Move => {
-                let dst = Self::destination(instruction.operands[0]);
+                let dst = Self::destination(instruction.operands[0], self.pc, instruction.opcode)?;
                 let value = self.read_operand(instruction.operands[1]);
                 self.write_register(dst, value);
             }
@@ -144,12 +145,14 @@ impl Vm {
         if advance_pc {
             self.pc += 1;
         }
+        Ok(())
     }
 
-    pub fn run(&mut self) {
+    pub fn run(&mut self) -> Result<()> {
         while !self.halted {
-            self.step();
+            self.step()?;
         }
+        Ok(())
     }
 
     pub fn format_registers_compact(&self, per_line: usize) -> String {

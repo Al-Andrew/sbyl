@@ -1,5 +1,4 @@
-use std::error::Error;
-use std::fmt::{Display, Formatter};
+use anyhow::{Result, anyhow, bail, ensure};
 
 use crate::instruction::{Instruction, OpCode, Operand};
 
@@ -13,51 +12,9 @@ const BYTES_PER_INSTRUCTION: usize = WORDS_PER_INSTRUCTION * WORD_SIZE;
 const OPERAND_KIND_REGISTER: u16 = 0;
 const OPERAND_KIND_IMMEDIATE: u16 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BytecodeError {
-    InvalidMagic([u8; 4]),
-    UnsupportedVersion(u32),
-    InvalidLength {
-        expected: usize,
-        actual: usize,
-    },
-    UnknownOpcode(u64),
-    UnknownOperandKind(u16),
-    InstructionCountTooLarge(u64),
-    ProgramTooLarge(usize),
-}
-
-impl Display for BytecodeError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidMagic(found) => write!(f, "invalid bytecode magic: {found:?}"),
-            Self::UnsupportedVersion(version) => {
-                write!(f, "unsupported bytecode version: {version}")
-            }
-            Self::InvalidLength { expected, actual } => {
-                write!(
-                    f,
-                    "invalid bytecode length: expected {expected} bytes, found {actual}"
-                )
-            }
-            Self::UnknownOpcode(opcode) => write!(f, "unknown opcode value: {opcode}"),
-            Self::UnknownOperandKind(kind) => write!(f, "unknown operand kind value: {kind}"),
-            Self::InstructionCountTooLarge(count) => {
-                write!(f, "instruction count too large for this platform: {count}")
-            }
-            Self::ProgramTooLarge(count) => write!(
-                f,
-                "program has too many instructions to encode in u64 count: {count}"
-            ),
-        }
-    }
-}
-
-impl Error for BytecodeError {}
-
-pub fn encode_program(program: &[Instruction]) -> Result<Vec<u8>, BytecodeError> {
-    let instruction_count =
-        u64::try_from(program.len()).map_err(|_| BytecodeError::ProgramTooLarge(program.len()))?;
+pub fn encode_program(program: &[Instruction]) -> Result<Vec<u8>> {
+    let instruction_count = u64::try_from(program.len())
+        .map_err(|_| anyhow!("program has too many instructions to encode in u64 count: {}", program.len()))?;
     let mut bytes = Vec::with_capacity(HEADER_SIZE + program.len() * BYTES_PER_INSTRUCTION);
 
     bytes.extend_from_slice(MAGIC);
@@ -79,36 +36,34 @@ pub fn encode_program(program: &[Instruction]) -> Result<Vec<u8>, BytecodeError>
     Ok(bytes)
 }
 
-pub fn decode_program(bytes: &[u8]) -> Result<Vec<Instruction>, BytecodeError> {
-    if bytes.len() < HEADER_SIZE {
-        return Err(BytecodeError::InvalidLength {
-            expected: HEADER_SIZE,
-            actual: bytes.len(),
-        });
-    }
+pub fn decode_program(bytes: &[u8]) -> Result<Vec<Instruction>> {
+    ensure!(
+        bytes.len() >= HEADER_SIZE,
+        "invalid bytecode length: expected at least {HEADER_SIZE} bytes, found {}",
+        bytes.len()
+    );
 
     let mut magic = [0u8; 4];
     magic.copy_from_slice(&bytes[0..4]);
-    if &magic != MAGIC {
-        return Err(BytecodeError::InvalidMagic(magic));
-    }
+    ensure!(&magic == MAGIC, "invalid bytecode magic: {magic:?}");
 
     let version = read_u32(bytes, 4);
-    if version != VERSION {
-        return Err(BytecodeError::UnsupportedVersion(version));
-    }
+    ensure!(
+        version == VERSION,
+        "unsupported bytecode version: {version}"
+    );
 
     let instruction_count_u64 = read_u64(bytes, 8);
-    let instruction_count = usize::try_from(instruction_count_u64)
-        .map_err(|_| BytecodeError::InstructionCountTooLarge(instruction_count_u64))?;
+    let instruction_count = usize::try_from(instruction_count_u64).map_err(|_| {
+        anyhow!("instruction count too large for this platform: {instruction_count_u64}")
+    })?;
 
     let expected = HEADER_SIZE + instruction_count * BYTES_PER_INSTRUCTION;
-    if bytes.len() != expected {
-        return Err(BytecodeError::InvalidLength {
-            expected,
-            actual: bytes.len(),
-        });
-    }
+    ensure!(
+        bytes.len() == expected,
+        "invalid bytecode length: expected {expected} bytes, found {}",
+        bytes.len()
+    );
 
     let mut program = Vec::with_capacity(instruction_count);
     let mut offset = HEADER_SIZE;
@@ -155,11 +110,11 @@ fn pack_operand_kinds(operands: [Operand; 4]) -> u64 {
     packed
 }
 
-fn decode_operand(kind: u16, value: u64) -> Result<Operand, BytecodeError> {
+fn decode_operand(kind: u16, value: u64) -> Result<Operand> {
     match kind {
         OPERAND_KIND_REGISTER => Ok(Operand::Register(value)),
         OPERAND_KIND_IMMEDIATE => Ok(Operand::Immediate(value)),
-        unknown => Err(BytecodeError::UnknownOperandKind(unknown)),
+        unknown => bail!("unknown operand kind value: {unknown}"),
     }
 }
 
@@ -187,7 +142,7 @@ fn encode_opcode(opcode: OpCode) -> u64 {
     }
 }
 
-fn decode_opcode(value: u64) -> Result<OpCode, BytecodeError> {
+fn decode_opcode(value: u64) -> Result<OpCode> {
     match value {
         0 => Ok(OpCode::Add),
         1 => Ok(OpCode::Sub),
@@ -202,7 +157,7 @@ fn decode_opcode(value: u64) -> Result<OpCode, BytecodeError> {
         10 => Ok(OpCode::JumpIf),
         11 => Ok(OpCode::Move),
         12 => Ok(OpCode::Halt),
-        unknown => Err(BytecodeError::UnknownOpcode(unknown)),
+        unknown => bail!("unknown opcode value: {unknown}"),
     }
 }
 
@@ -257,7 +212,7 @@ mod tests {
         bytes[0] = b'X';
 
         let error = decode_program(&bytes).expect_err("should fail");
-        assert!(matches!(error, BytecodeError::InvalidMagic(_)));
+        assert!(error.to_string().contains("invalid bytecode magic"));
     }
 
     #[test]
@@ -268,7 +223,7 @@ mod tests {
         bytes[24..32].copy_from_slice(&unknown_opcode);
 
         let error = decode_program(&bytes).expect_err("should fail");
-        assert!(matches!(error, BytecodeError::UnknownOpcode(99)));
+        assert!(error.to_string().contains("unknown opcode value: 99"));
     }
 
     #[test]
@@ -282,6 +237,6 @@ mod tests {
         bytes[32..40].copy_from_slice(&kinds_u64.to_le_bytes());
 
         let error = decode_program(&bytes).expect_err("should fail");
-        assert!(matches!(error, BytecodeError::UnknownOperandKind(2)));
+        assert!(error.to_string().contains("unknown operand kind value: 2"));
     }
 }

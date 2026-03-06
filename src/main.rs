@@ -1,9 +1,11 @@
-use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use reglang::{Vm, assemble_program, decode_program, disassemble_program, encode_program};
+use miette::{IntoDiagnostic, Result as MietteResult, WrapErr, miette};
+use reglang::{
+    Vm, assemble_program_with_context, decode_program, disassemble_program, encode_program,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "reglang")]
@@ -40,7 +42,11 @@ enum Commands {
     },
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> MietteResult<()> {
+    run_cli()
+}
+
+fn run_cli() -> MietteResult<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -81,36 +87,45 @@ fn required_arg(
     positional: Option<PathBuf>,
     named: Option<PathBuf>,
     arg_name: &str,
-) -> Result<PathBuf, Box<dyn Error>> {
+) -> MietteResult<PathBuf> {
     positional
         .or(named)
-        .ok_or_else(|| format!("missing required argument: {arg_name}").into())
+        .ok_or_else(|| miette!("missing required argument: {arg_name}"))
 }
 
 fn optional_arg(positional: Option<PathBuf>, named: Option<PathBuf>) -> Option<PathBuf> {
     positional.or(named)
 }
 
-fn run_command(input: &Path, print_registers: bool) -> Result<(), Box<dyn Error>> {
+fn run_command(input: &Path, print_registers: bool) -> MietteResult<()> {
     let extension = extension(input)?;
     let program = match extension {
         "sby" => {
-            let bytes = fs::read(input)?;
-            decode_program(&bytes)?
+            let bytes = fs::read(input)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed reading bytecode file: {}", input.display()))?;
+            decode_program(&bytes)
+                .map_err(|error| miette!("{error:#}"))
+                .wrap_err_with(|| format!("failed decoding bytecode file: {}", input.display()))?
         }
         "sas" => {
-            let source = fs::read_to_string(input)?;
-            assemble_program(&source)?
+            let source = fs::read_to_string(input)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed reading assembly source: {}", input.display()))?;
+            assemble_program_with_context(&input.display().to_string(), &source)
+                .wrap_err_with(|| format!("failed assembling source file: {}", input.display()))?
         }
         _ => {
-            return Err(
-                format!("unsupported input extension `{extension}`, expected .sas or .sby").into(),
-            );
+            return Err(miette!(
+                "unsupported input extension `{extension}`, expected .sas or .sby"
+            ));
         }
     };
 
     let mut vm = Vm::new(program);
-    vm.run();
+    vm.run()
+        .map_err(|error| miette!("{error:#}"))
+        .wrap_err_with(|| format!("failed executing program: {}", input.display()))?;
 
     if print_registers {
         println!("Final registers:");
@@ -120,22 +135,33 @@ fn run_command(input: &Path, print_registers: bool) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-fn assemble_command(input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+fn assemble_command(input: &Path, output: &Path) -> MietteResult<()> {
     ensure_extension(input, "sas")?;
     ensure_extension(output, "sby")?;
 
-    let source = fs::read_to_string(input)?;
-    let program = assemble_program(&source)?;
-    let bytes = encode_program(&program)?;
-    fs::write(output, bytes)?;
+    let source = fs::read_to_string(input)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed reading assembly source: {}", input.display()))?;
+    let program = assemble_program_with_context(&input.display().to_string(), &source)
+        .wrap_err_with(|| format!("failed assembling source file: {}", input.display()))?;
+    let bytes = encode_program(&program)
+        .map_err(|error| miette!("{error:#}"))
+        .wrap_err_with(|| format!("failed encoding bytecode for: {}", input.display()))?;
+    fs::write(output, bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed writing bytecode output: {}", output.display()))?;
     Ok(())
 }
 
-fn disassemble_command(input: &Path, output: Option<&Path>) -> Result<(), Box<dyn Error>> {
+fn disassemble_command(input: &Path, output: Option<&Path>) -> MietteResult<()> {
     ensure_extension(input, "sby")?;
 
-    let bytes = fs::read(input)?;
-    let program = decode_program(&bytes)?;
+    let bytes = fs::read(input)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed reading bytecode file: {}", input.display()))?;
+    let program = decode_program(&bytes)
+        .map_err(|error| miette!("{error:#}"))
+        .wrap_err_with(|| format!("failed decoding bytecode file: {}", input.display()))?;
     let mut assembly = disassemble_program(&program);
     if !assembly.is_empty() {
         assembly.push('\n');
@@ -143,7 +169,14 @@ fn disassemble_command(input: &Path, output: Option<&Path>) -> Result<(), Box<dy
 
     if let Some(output_path) = output {
         ensure_extension(output_path, "sas")?;
-        fs::write(output_path, assembly)?;
+        fs::write(output_path, assembly)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed writing disassembled source file: {}",
+                    output_path.display()
+                )
+            })?;
     } else {
         print!("{assembly}");
     }
@@ -151,21 +184,20 @@ fn disassemble_command(input: &Path, output: Option<&Path>) -> Result<(), Box<dy
     Ok(())
 }
 
-fn extension(path: &Path) -> Result<&str, Box<dyn Error>> {
+fn extension(path: &Path) -> MietteResult<&str> {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .ok_or_else(|| format!("file has no valid extension: {}", path.display()).into())
+        .ok_or_else(|| miette!("file has no valid extension: {}", path.display()))
 }
 
-fn ensure_extension(path: &Path, expected: &str) -> Result<(), Box<dyn Error>> {
+fn ensure_extension(path: &Path, expected: &str) -> MietteResult<()> {
     let ext = extension(path)?;
     if ext == expected {
         Ok(())
     } else {
-        Err(format!(
+        Err(miette!(
             "expected .{expected} file, got .{ext}: {}",
             path.display()
-        )
-        .into())
+        ))
     }
 }
