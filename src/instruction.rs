@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpCode {
     Add, // args: r0, r1, t2 (t2 can be a register or an immediate value), r0 = r1 + t2
     Sub, // args: r0, r1, t2 (t2 can be a register or an immediate value), r0 = r1 - t2
@@ -15,13 +15,13 @@ pub enum OpCode {
     Halt, // args: none, halt the program
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
     Register(u64),
     Immediate(u64),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Instruction {
     pub opcode: OpCode,
     pub operands: [Operand; 4],
