@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use reglang::{Operand, Vm, assemble_program, decode_program, disassemble_program, encode_program};
+use reglang::{Vm, assemble_program, decode_program, disassemble_program, encode_program};
 
 #[derive(Parser, Debug)]
 #[command(name = "reglang")]
@@ -19,6 +19,8 @@ enum Commands {
         input: Option<PathBuf>,
         #[arg(long, value_name = "INPUT", conflicts_with = "input")]
         input_flag: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        print_registers: bool,
     },
     Assemble {
         input: Option<PathBuf>,
@@ -42,9 +44,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { input, input_flag } => {
+        Commands::Run {
+            input,
+            input_flag,
+            print_registers,
+        } => {
             let input = required_arg(input, input_flag, "input")?;
-            run_command(&input)?;
+            run_command(&input, print_registers)?;
         }
         Commands::Assemble {
             input,
@@ -85,7 +91,7 @@ fn optional_arg(positional: Option<PathBuf>, named: Option<PathBuf>) -> Option<P
     positional.or(named)
 }
 
-fn run_command(input: &Path) -> Result<(), Box<dyn Error>> {
+fn run_command(input: &Path, print_registers: bool) -> Result<(), Box<dyn Error>> {
     let extension = extension(input)?;
     let program = match extension {
         "sby" => {
@@ -106,9 +112,9 @@ fn run_command(input: &Path) -> Result<(), Box<dyn Error>> {
     let mut vm = Vm::new(program);
     vm.run();
 
-    println!("Final registers:");
-    for reg in 0..=3 {
-        println!("r{reg} = {}", vm.read_operand(Operand::Register(reg)));
+    if print_registers {
+        println!("Final registers:");
+        println!("{}", vm.format_registers_compact(3));
     }
 
     Ok(())

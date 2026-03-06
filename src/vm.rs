@@ -151,4 +151,31 @@ impl Vm {
             self.step();
         }
     }
+
+    pub fn format_registers_compact(&self, per_line: usize) -> String {
+        if self.registers.is_empty() {
+            return "(no registers)".to_string();
+        }
+
+        let per_line = per_line.max(1);
+        let width = self
+            .registers
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| format!("r{idx} = {value}").len())
+            .max()
+            .unwrap_or(0);
+
+        let mut lines = Vec::new();
+        for chunk in self.registers.chunks(per_line) {
+            let mut row = Vec::new();
+            for (offset, value) in chunk.iter().enumerate() {
+                let idx = lines.len() * per_line + offset;
+                row.push(format!("r{idx} = {value:<width$}", width = width));
+            }
+            lines.push(row.join("    "));
+        }
+
+        lines.join("\n")
+    }
 }
