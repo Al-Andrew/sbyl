@@ -1,4 +1,3 @@
-
 move r0, 0
 move r1, 1
 move r2, 0

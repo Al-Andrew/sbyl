@@ -3,7 +3,14 @@ use std::collections::{BTreeMap, HashMap};
 use anyhow::{Result, anyhow, bail};
 use miette::{LabeledSpan, NamedSource, miette};
 
-use crate::instruction::{Instruction, OpCode, Operand};
+use crate::instruction::{Instruction, MemoryBase, MemoryRef, OpCode, Operand};
+
+const SP_REG: u64 = 16;
+const BP_REG: u64 = 17;
+const IP_REG: u64 = 18;
+const FLAGS_REG: u64 = 19;
+const RESERVED_START: u64 = 16;
+const RESERVED_END: u64 = 31;
 
 #[derive(Debug, Clone)]
 struct ParsedInstruction {
@@ -16,7 +23,14 @@ struct ParsedInstruction {
 enum OperandToken {
     Register(u64),
     Immediate(u64),
+    Memory(MemoryToken),
     Label(String),
+}
+
+#[derive(Debug, Clone)]
+enum MemoryToken {
+    Absolute(u64),
+    RegisterRelative { base: u64, offset: u64 },
 }
 
 pub fn assemble_program(source: &str) -> Result<Vec<Instruction>> {
@@ -149,10 +163,10 @@ fn parse_instruction(content: &str, line: usize) -> Result<ParsedInstruction> {
         "jump" => (OpCode::Jump, "jump", 1),
         "jumpif" => (OpCode::JumpIf, "jumpif", 2),
         "move" => (OpCode::Move, "move", 2),
+        "push" => (OpCode::Push, "push", 1),
+        "pop" => (OpCode::Pop, "pop", 1),
         "halt" => (OpCode::Halt, "halt", 0),
-        _ => {
-            bail!("line {line}: unknown opcode `{mnemonic}`");
-        }
+        _ => bail!("line {line}: unknown opcode `{mnemonic}`"),
     };
 
     let operands = if operand_str.is_empty() {
@@ -183,11 +197,12 @@ fn parse_operand_token(token: &str, line: usize) -> Result<OperandToken> {
         bail!("line {line}: invalid operand `{token}`");
     }
 
-    if let Some(register) = token.strip_prefix('r') {
-        let value = register
-            .parse::<u64>()
-            .map_err(|_| anyhow!("line {line}: invalid operand `{token}`"))?;
-        return Ok(OperandToken::Register(value));
+    if token.starts_with('[') || token.ends_with(']') {
+        return parse_memory_token(token, line).map(OperandToken::Memory);
+    }
+
+    if let Some(register) = parse_register_name(token) {
+        return Ok(OperandToken::Register(register));
     }
 
     if let Ok(value) = token.parse::<u64>() {
@@ -201,12 +216,50 @@ fn parse_operand_token(token: &str, line: usize) -> Result<OperandToken> {
     bail!("line {line}: invalid operand `{token}`")
 }
 
+fn parse_memory_token(token: &str, line: usize) -> Result<MemoryToken> {
+    if !(token.starts_with('[') && token.ends_with(']')) {
+        bail!("line {line}: invalid operand `{token}`");
+    }
+
+    let inner = token[1..token.len() - 1].trim();
+    if inner.is_empty() {
+        bail!("line {line}: invalid operand `{token}`");
+    }
+
+    if inner.contains('-') {
+        bail!("line {line}: negative offsets are not supported in `{token}`");
+    }
+
+    if let Ok(value) = inner.parse::<u64>() {
+        return Ok(MemoryToken::Absolute(value));
+    }
+
+    if let Some(base) = parse_register_name(inner) {
+        return Ok(MemoryToken::RegisterRelative { base, offset: 0 });
+    }
+
+    if let Some((base_str, offset_str)) = inner.split_once('+') {
+        let base_str = base_str.trim();
+        let offset_str = offset_str.trim();
+        let Some(base) = parse_register_name(base_str) else {
+            bail!("line {line}: invalid operand `{token}`");
+        };
+        let offset = offset_str
+            .parse::<u64>()
+            .map_err(|_| anyhow!("line {line}: invalid operand `{token}`"))?;
+        return Ok(MemoryToken::RegisterRelative { base, offset });
+    }
+
+    bail!("line {line}: invalid operand `{token}`")
+}
+
 fn lower_instruction(
     parsed: &ParsedInstruction,
     labels: &HashMap<String, usize>,
 ) -> Result<Instruction> {
-    let mut operands = [Operand::Register(0); 4];
+    validate_instruction(parsed)?;
 
+    let mut operands = [Operand::Register(0); 4];
     for (idx, token) in parsed.operands.iter().enumerate() {
         operands[idx] = lower_operand(parsed, idx, token, labels)?;
     }
@@ -217,33 +270,50 @@ fn lower_instruction(
     })
 }
 
+fn validate_instruction(parsed: &ParsedInstruction) -> Result<()> {
+    match parsed.opcode {
+        OpCode::Move => {
+            let dst = parsed.operands.first().expect("validated arity");
+            let src = parsed.operands.get(1).expect("validated arity");
+
+            if matches!(dst, OperandToken::Immediate(_) | OperandToken::Label(_)) {
+                bail!("line {}: destination operand must be register or memory", parsed.line);
+            }
+            if matches!(dst, OperandToken::Memory(_)) && matches!(src, OperandToken::Memory(_)) {
+                bail!("line {}: move does not support memory-to-memory transfers", parsed.line);
+            }
+            if let OperandToken::Register(reg) = dst {
+                validate_writable_register(*reg, parsed.line)?;
+            }
+        }
+        OpCode::Pop => match parsed.operands.first().expect("validated arity") {
+            OperandToken::Register(reg) => validate_writable_register(*reg, parsed.line)?,
+            _ => bail!("line {}: destination operand must be a register", parsed.line),
+        },
+        OpCode::Add
+        | OpCode::Sub
+        | OpCode::Mul
+        | OpCode::Div
+        | OpCode::Eq
+        | OpCode::Gt
+        | OpCode::Lt
+        | OpCode::Gte
+        | OpCode::Lte => match parsed.operands.first().expect("validated arity") {
+            OperandToken::Register(reg) => validate_writable_register(*reg, parsed.line)?,
+            _ => bail!("line {}: destination operand must be a register", parsed.line),
+        },
+        _ => {}
+    }
+
+    Ok(())
+}
+
 fn lower_operand(
     parsed: &ParsedInstruction,
     idx: usize,
     token: &OperandToken,
     labels: &HashMap<String, usize>,
 ) -> Result<Operand> {
-    let is_destination = matches!(
-        parsed.opcode,
-        OpCode::Add
-            | OpCode::Sub
-            | OpCode::Mul
-            | OpCode::Div
-            | OpCode::Eq
-            | OpCode::Gt
-            | OpCode::Lt
-            | OpCode::Gte
-            | OpCode::Lte
-            | OpCode::Move
-    ) && idx == 0;
-
-    if is_destination {
-        return match token {
-            OperandToken::Register(reg) => Ok(Operand::Register(*reg)),
-            _ => bail!("line {}: destination operand must be a register", parsed.line),
-        };
-    }
-
     let is_jump_target = (parsed.opcode == OpCode::Jump && idx == 0)
         || (parsed.opcode == OpCode::JumpIf && idx == 1);
 
@@ -266,7 +336,28 @@ fn lower_operand(
     match token {
         OperandToken::Register(value) => Ok(Operand::Register(*value)),
         OperandToken::Immediate(value) => Ok(Operand::Immediate(*value)),
+        OperandToken::Memory(MemoryToken::Absolute(offset)) => Ok(Operand::Memory(MemoryRef {
+            base: MemoryBase::Absolute,
+            offset: *offset,
+        })),
+        OperandToken::Memory(MemoryToken::RegisterRelative { base, offset }) => {
+            Ok(Operand::Memory(MemoryRef {
+                base: MemoryBase::Register(*base),
+                offset: *offset,
+            }))
+        }
         OperandToken::Label(label) => bail!("line {}: unknown label `{label}`", parsed.line),
+    }
+}
+
+fn validate_writable_register(reg: u64, line: usize) -> Result<()> {
+    match reg {
+        IP_REG => bail!("line {line}: cannot write to reserved register `ip`"),
+        FLAGS_REG => bail!("line {line}: cannot write to reserved register `flags`"),
+        RESERVED_START..=RESERVED_END if reg > BP_REG => {
+            bail!("line {line}: cannot write to reserved register `r{reg}`")
+        }
+        _ => Ok(()),
     }
 }
 
@@ -365,6 +456,8 @@ fn format_instruction(instruction: Instruction, labels: &BTreeMap<usize, String>
             format_operand(instruction.operands[0]),
             format_operand(instruction.operands[1])
         ),
+        OpCode::Push => format!("push {}", format_operand(instruction.operands[0])),
+        OpCode::Pop => format!("pop {}", format_operand(instruction.operands[0])),
         OpCode::Halt => "halt".to_string(),
     }
 }
@@ -380,8 +473,37 @@ fn format_jump_target(operand: Operand, labels: &BTreeMap<usize, String>) -> Str
 
 fn format_operand(operand: Operand) -> String {
     match operand {
-        Operand::Register(reg) => format!("r{reg}"),
+        Operand::Register(reg) => format_register(reg),
         Operand::Immediate(value) => value.to_string(),
+        Operand::Memory(memory) => format_memory(memory),
+    }
+}
+
+fn format_memory(memory: MemoryRef) -> String {
+    match memory.base {
+        MemoryBase::Absolute => format!("[{}]", memory.offset),
+        MemoryBase::Register(base) if memory.offset == 0 => format!("[{}]", format_register(base)),
+        MemoryBase::Register(base) => format!("[{}+{}]", format_register(base), memory.offset),
+    }
+}
+
+fn format_register(reg: u64) -> String {
+    match reg {
+        SP_REG => "sp".to_string(),
+        BP_REG => "bp".to_string(),
+        IP_REG => "ip".to_string(),
+        FLAGS_REG => "flags".to_string(),
+        _ => format!("r{reg}"),
+    }
+}
+
+fn parse_register_name(token: &str) -> Option<u64> {
+    match token.to_ascii_lowercase().as_str() {
+        "sp" => Some(SP_REG),
+        "bp" => Some(BP_REG),
+        "ip" => Some(IP_REG),
+        "flags" => Some(FLAGS_REG),
+        _ => token.strip_prefix('r')?.parse::<u64>().ok(),
     }
 }
 
@@ -559,12 +681,56 @@ entry:
     }
 
     #[test]
-    fn disassemble_emits_labels_for_targets() {
+    fn assemble_supports_memory_operands_and_aliases() {
+        let src = "move [bp+8], 42\nmove r1, [sp]\npush r2\npop bp";
+        let program = assemble_program(src).expect("assembly should parse");
+
+        assert_eq!(
+            program[0].operands[0],
+            Operand::Memory(MemoryRef {
+                base: MemoryBase::Register(BP_REG),
+                offset: 8,
+            })
+        );
+        assert_eq!(
+            program[1].operands[1],
+            Operand::Memory(MemoryRef {
+                base: MemoryBase::Register(SP_REG),
+                offset: 0,
+            })
+        );
+        assert_eq!(program[2].opcode, OpCode::Push);
+        assert_eq!(program[3].operands[0], Operand::Register(BP_REG));
+    }
+
+    #[test]
+    fn assemble_rejects_invalid_memory_usage() {
+        let error = assemble_program("move [r0], [r1]").expect_err("should fail");
+        assert!(error.to_string().contains("memory-to-memory"));
+
+        let error = assemble_program("move r0, [bp-8]").expect_err("should fail");
+        assert!(error.to_string().contains("negative offsets"));
+    }
+
+    #[test]
+    fn assemble_rejects_reserved_register_writes() {
+        let error = assemble_program("move ip, 1").expect_err("should fail");
+        assert!(error.to_string().contains("reserved register `ip`"));
+
+        let error = assemble_program("pop flags").expect_err("should fail");
+        assert!(error.to_string().contains("reserved register `flags`"));
+
+        let error = assemble_program("move r20, 1").expect_err("should fail");
+        assert!(error.to_string().contains("reserved register `r20`"));
+    }
+
+    #[test]
+    fn disassemble_emits_labels_for_targets_and_aliases() {
         let program = vec![
             Instruction {
                 opcode: OpCode::Move,
                 operands: [
-                    Operand::Register(0),
+                    Operand::Register(SP_REG),
                     Operand::Immediate(0),
                     Operand::Register(0),
                     Operand::Register(0),
@@ -584,6 +750,7 @@ entry:
         let text = disassemble_program(&program);
         assert!(text.contains("L0:"));
         assert!(text.contains("jump L0"));
+        assert!(text.contains("move sp, 0"));
     }
 
     #[test]
@@ -593,6 +760,9 @@ loop:
     add r0, r0, 1
     lt r1, r0, 10
     jumpif r1, loop
+    move [bp+8], r0
+    push 7
+    pop bp
     halt
 "#;
 
@@ -603,6 +773,6 @@ loop:
 
         let disassembled = disassemble_program(&decoded);
         assert!(disassembled.contains("L0:"));
+        assert!(disassembled.contains("move [bp+8], r0"));
     }
 }
-
