@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 
 const STACK_CAP_BYTES: usize = 64 * 1024 * 1024;
 const WORD_BYTES: usize = 8;
+const CALL_FRAME_METADATA_BYTES: u64 = 16;
 const REGISTER_BANK_SIZE: usize = 32;
 const SP_REG: usize = 16;
 const BP_REG: usize = 17;
@@ -159,6 +160,54 @@ impl Vm {
         self.write_system_register(SP_REG, value);
     }
 
+    fn push_value(&mut self, value: u64, pc: usize, opcode: OpCode) -> Result<()> {
+        let sp = self.sp();
+        if sp % WORD_BYTES as u64 != 0 {
+            bail!("vm runtime error at pc {pc} ({opcode:?}): unaligned stack pointer {sp}");
+        }
+        self.write_word(sp, value, pc, opcode)?;
+        let next_sp = sp
+            .checked_add(WORD_BYTES as u64)
+            .ok_or_else(|| anyhow::anyhow!("vm runtime error at pc {pc} ({opcode:?}): stack pointer overflow"))?;
+        self.set_sp(next_sp);
+        Ok(())
+    }
+
+    fn pop_value(&mut self, pc: usize, opcode: OpCode) -> Result<u64> {
+        let sp = self.sp();
+        if sp < WORD_BYTES as u64 {
+            bail!("vm runtime error at pc {pc} ({opcode:?}): stack underflow");
+        }
+        let next_sp = sp - WORD_BYTES as u64;
+        if next_sp % WORD_BYTES as u64 != 0 {
+            bail!("vm runtime error at pc {pc} ({opcode:?}): unaligned stack pointer {next_sp}");
+        }
+        let value = self.read_word(next_sp, pc, opcode)?;
+        self.set_sp(next_sp);
+        Ok(value)
+    }
+
+    fn read_frame_size(&self, operand: Operand, opcode: OpCode, label: &str) -> Result<u64> {
+        let value = self.read_operand(operand)?;
+        if value % WORD_BYTES as u64 != 0 {
+            bail!(
+                "vm runtime error at pc {} ({opcode:?}): {label} must be a multiple of {} bytes, got {value}",
+                self.pc,
+                WORD_BYTES
+            );
+        }
+        Ok(value)
+    }
+
+    fn read_call_frame_word(&self, addr: u64, opcode: OpCode, label: &str) -> Result<u64> {
+        self.read_word(addr, self.pc, opcode).map_err(|error| {
+            anyhow::anyhow!(
+                "vm runtime error at pc {} ({opcode:?}): return without active call frame: cannot read {label}: {error}",
+                self.pc
+            )
+        })
+    }
+
     pub fn step(&mut self) -> Result<()> {
         if self.halted {
             return Ok(());
@@ -243,6 +292,73 @@ impl Vm {
                     advance_pc = false;
                 }
             }
+            OpCode::Call => {
+                let target = self.read_operand(instruction.operands[0])? as usize;
+                let in_bytes = self.read_frame_size(instruction.operands[1], instruction.opcode, "input frame size")?;
+                let out_bytes =
+                    self.read_frame_size(instruction.operands[2], instruction.opcode, "output frame size")?;
+                let frame_bytes = in_bytes.checked_add(out_bytes).ok_or_else(|| {
+                    anyhow::anyhow!("vm runtime error at pc {} (Call): frame size overflow", self.pc)
+                })?;
+                let sp = self.sp();
+                if sp < frame_bytes {
+                    bail!(
+                        "vm runtime error at pc {} (Call): insufficient caller frame space, need {frame_bytes} bytes but sp is {sp}",
+                        self.pc
+                    );
+                }
+
+                let frame_base = sp - frame_bytes;
+                let caller_bp = self.read_register(BP_REG, self.pc, instruction.opcode)?;
+                self.push_value(caller_bp, self.pc, instruction.opcode)?;
+                self.push_value((self.pc + 1) as u64, self.pc, instruction.opcode)?;
+                self.write_system_register(BP_REG, frame_base);
+                self.pc = target;
+                advance_pc = false;
+            }
+            OpCode::Ret => {
+                let in_bytes = self.read_frame_size(instruction.operands[0], instruction.opcode, "input frame size")?;
+                let out_bytes =
+                    self.read_frame_size(instruction.operands[1], instruction.opcode, "output frame size")?;
+                let frame_bytes = in_bytes.checked_add(out_bytes).ok_or_else(|| {
+                    anyhow::anyhow!("vm runtime error at pc {} (Ret): frame size overflow", self.pc)
+                })?;
+                let metadata_start = self
+                    .read_register(BP_REG, self.pc, instruction.opcode)?
+                    .checked_add(frame_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("vm runtime error at pc {} (Ret): frame address overflow", self.pc))?;
+                let metadata_end = metadata_start.checked_add(CALL_FRAME_METADATA_BYTES).ok_or_else(|| {
+                    anyhow::anyhow!("vm runtime error at pc {} (Ret): frame address overflow", self.pc)
+                })?;
+                let sp = self.sp();
+                if sp < metadata_end {
+                    bail!(
+                        "vm runtime error at pc {} (Ret): return without active call frame",
+                        self.pc
+                    );
+                }
+
+                let saved_bp = self.read_call_frame_word(metadata_start, instruction.opcode, "saved bp")?;
+                let return_pc = self.read_call_frame_word(
+                    metadata_start + WORD_BYTES as u64,
+                    instruction.opcode,
+                    "return pc",
+                )?;
+                if usize::try_from(return_pc).map_or(true, |pc| pc >= self.program.len()) {
+                    bail!(
+                        "vm runtime error at pc {} (Ret): malformed return pc {return_pc}",
+                        self.pc
+                    );
+                }
+
+                let next_sp = self.read_register(BP_REG, self.pc, instruction.opcode)?.checked_add(out_bytes).ok_or_else(
+                    || anyhow::anyhow!("vm runtime error at pc {} (Ret): stack pointer overflow", self.pc),
+                )?;
+                self.set_sp(next_sp);
+                self.write_system_register(BP_REG, saved_bp);
+                self.pc = return_pc as usize;
+                advance_pc = false;
+            }
             OpCode::Move => match (instruction.operands[0], instruction.operands[1]) {
                 (Operand::Register(dst), src) => {
                     let value = self.read_operand(src)?;
@@ -263,29 +379,12 @@ impl Vm {
                 ),
             },
             OpCode::Push => {
-                let sp = self.sp();
-                if sp % WORD_BYTES as u64 != 0 {
-                    bail!("vm runtime error at pc {} (Push): unaligned stack pointer {sp}", self.pc);
-                }
                 let value = self.read_operand(instruction.operands[0])?;
-                self.write_word(sp, value, self.pc, instruction.opcode)?;
-                let next_sp = sp.checked_add(WORD_BYTES as u64).ok_or_else(|| {
-                    anyhow::anyhow!("vm runtime error at pc {} (Push): stack pointer overflow", self.pc)
-                })?;
-                self.set_sp(next_sp);
+                self.push_value(value, self.pc, instruction.opcode)?;
             }
             OpCode::Pop => {
                 let dst = Self::destination(instruction.operands[0], self.pc, instruction.opcode)?;
-                let sp = self.sp();
-                if sp < WORD_BYTES as u64 {
-                    bail!("vm runtime error at pc {} (Pop): stack underflow", self.pc);
-                }
-                let next_sp = sp - WORD_BYTES as u64;
-                if next_sp % WORD_BYTES as u64 != 0 {
-                    bail!("vm runtime error at pc {} (Pop): unaligned stack pointer {next_sp}", self.pc);
-                }
-                let value = self.read_word(next_sp, self.pc, instruction.opcode)?;
-                self.set_sp(next_sp);
+                let value = self.pop_value(self.pc, instruction.opcode)?;
                 self.write_register(dst, value, self.pc, instruction.opcode)?;
             }
             OpCode::Halt => {
@@ -351,11 +450,18 @@ fn format_register_name(reg: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asm::assemble_program;
+    use std::fs;
 
     fn run_program(program: Vec<Instruction>) -> Result<Vm> {
         let mut vm = Vm::new(program);
         vm.run()?;
         Ok(vm)
+    }
+
+    fn run_assembly_program(source: &str) -> Result<Vm> {
+        let program = assemble_program(source)?;
+        run_program(program)
     }
 
     #[test]
@@ -686,5 +792,120 @@ mod tests {
         assert!(formatted.contains("bp = 16"));
         assert!(formatted.contains("ip = 3"));
         assert!(formatted.contains("flags = 1"));
+    }
+
+    #[test]
+    fn call_and_ret_support_single_argument_single_result() {
+        let vm = run_assembly_program(
+            r#"
+    push 0
+    push 41
+    call inc, 8, 8
+    pop r0
+    halt
+
+inc:
+    move r0, [bp+8]
+    add r0, r0, 1
+    move [bp+0], r0
+    ret 8, 8
+"#,
+        )
+        .expect("run");
+
+        assert_eq!(vm.read_register(0, 0, OpCode::Move).expect("read"), 42);
+        assert_eq!(vm.read_register(SP_REG, 0, OpCode::Move).expect("read"), 0);
+        assert_eq!(vm.read_register(BP_REG, 0, OpCode::Move).expect("read"), 0);
+    }
+
+    #[test]
+    fn call_and_ret_preserve_result_area_on_stack() {
+        let vm = run_assembly_program(
+            r#"
+    push 0
+    push 0
+    push 7
+    call pair, 8, 16
+    pop r0
+    pop r1
+    halt
+
+pair:
+    move [bp+0], 11
+    move [bp+8], 22
+    ret 8, 16
+"#,
+        )
+        .expect("run");
+
+        assert_eq!(vm.read_register(0, 0, OpCode::Move).expect("read"), 22);
+        assert_eq!(vm.read_register(1, 0, OpCode::Move).expect("read"), 11);
+        assert_eq!(vm.read_register(SP_REG, 0, OpCode::Move).expect("read"), 0);
+    }
+
+    #[test]
+    fn call_and_ret_support_zero_output_bytes() {
+        let vm = run_assembly_program(
+            r#"
+    push 99
+    call sink, 8, 0
+    halt
+
+sink:
+    move r0, [bp+0]
+    ret 8, 0
+"#,
+        )
+        .expect("run");
+
+        assert_eq!(vm.read_register(0, 0, OpCode::Move).expect("read"), 99);
+        assert_eq!(vm.read_register(SP_REG, 0, OpCode::Move).expect("read"), 0);
+        assert_eq!(vm.read_register(BP_REG, 0, OpCode::Move).expect("read"), 0);
+    }
+
+    #[test]
+    fn call_rejects_missing_caller_frame_space() {
+        let mut vm = Vm::new(vec![Instruction {
+            opcode: OpCode::Call,
+            operands: [
+                Operand::Immediate(0),
+                Operand::Immediate(8),
+                Operand::Immediate(8),
+                Operand::Register(0),
+            ],
+        }]);
+
+        let error = vm.run().expect_err("should fail");
+        assert!(error
+            .to_string()
+            .contains("insufficient caller frame space"));
+    }
+
+    #[test]
+    fn ret_without_active_frame_fails_cleanly() {
+        let mut vm = Vm::new(vec![Instruction {
+            opcode: OpCode::Ret,
+            operands: [
+                Operand::Immediate(8),
+                Operand::Immediate(8),
+                Operand::Register(0),
+                Operand::Register(0),
+            ],
+        }]);
+
+        let error = vm.run().expect_err("should fail");
+        assert!(error
+            .to_string()
+            .contains("return without active call frame"));
+    }
+
+    #[test]
+    fn recursive_fibonacci_example_runs() {
+        let source = fs::read_to_string("examples/sas/fib_recursive.sas").expect("read example");
+        let vm = run_assembly_program(&source).expect("run");
+
+        assert_eq!(vm.read_register(0, 0, OpCode::Move).expect("read"), 55);
+        assert_eq!(vm.read_register(SP_REG, 0, OpCode::Move).expect("read"), 0);
+        assert_eq!(vm.read_register(BP_REG, 0, OpCode::Move).expect("read"), 0);
     }
 }

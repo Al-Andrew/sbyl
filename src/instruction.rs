@@ -11,6 +11,8 @@ pub enum OpCode {
     Lte, // args: r0, r1, t2 (t2 can be a register or an immediate value), r0 = 1 if r1 <= t2, r0 = 0 otherwise
     Jump, // args: i0, jump to i0
     JumpIf, // args: t0, t1, jump to t1 if t0 is not 0
+    Call, // args: i0, i1, i2; call i0 with i1 input bytes and i2 output bytes
+    Ret,  // args: i0, i1; return from call frame with i0 input bytes and i1 output bytes
     Move, // args: d0, t1 (exactly one side may be memory)
     Push, // args: t0, push t0 on the VM-managed stack
     Pop,  // args: r0, pop top-of-stack into r0
