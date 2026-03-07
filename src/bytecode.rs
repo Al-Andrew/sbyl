@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use crate::instruction::{Instruction, MemoryBase, MemoryRef, OpCode, Operand};
 
 const MAGIC: &[u8; 4] = b"RGLB";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const HEADER_SIZE: usize = 24;
 const WORD_SIZE: usize = 8;
 const WORDS_PER_INSTRUCTION: usize = 6;
@@ -191,10 +191,12 @@ fn encode_opcode(opcode: OpCode) -> u64 {
         OpCode::Lte => 8,
         OpCode::Jump => 9,
         OpCode::JumpIf => 10,
-        OpCode::Move => 11,
-        OpCode::Halt => 12,
-        OpCode::Push => 13,
-        OpCode::Pop => 14,
+        OpCode::Call => 11,
+        OpCode::Ret => 12,
+        OpCode::Move => 13,
+        OpCode::Halt => 14,
+        OpCode::Push => 15,
+        OpCode::Pop => 16,
     }
 }
 
@@ -211,10 +213,12 @@ fn decode_opcode(value: u64) -> Result<OpCode> {
         8 => Ok(OpCode::Lte),
         9 => Ok(OpCode::Jump),
         10 => Ok(OpCode::JumpIf),
-        11 => Ok(OpCode::Move),
-        12 => Ok(OpCode::Halt),
-        13 => Ok(OpCode::Push),
-        14 => Ok(OpCode::Pop),
+        11 => Ok(OpCode::Call),
+        12 => Ok(OpCode::Ret),
+        13 => Ok(OpCode::Move),
+        14 => Ok(OpCode::Halt),
+        15 => Ok(OpCode::Push),
+        16 => Ok(OpCode::Pop),
         unknown => bail!("unknown opcode value: {unknown}"),
     }
 }
@@ -238,10 +242,28 @@ mod tests {
                 ],
             },
             Instruction {
+                opcode: OpCode::Call,
+                operands: [
+                    Operand::Immediate(3),
+                    Operand::Immediate(8),
+                    Operand::Immediate(8),
+                    Operand::Register(0),
+                ],
+            },
+            Instruction {
                 opcode: OpCode::Push,
                 operands: [
                     Operand::Immediate(7),
                     Operand::Register(0),
+                    Operand::Register(0),
+                    Operand::Register(0),
+                ],
+            },
+            Instruction {
+                opcode: OpCode::Ret,
+                operands: [
+                    Operand::Immediate(8),
+                    Operand::Immediate(8),
                     Operand::Register(0),
                     Operand::Register(0),
                 ],

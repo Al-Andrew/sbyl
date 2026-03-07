@@ -162,6 +162,8 @@ fn parse_instruction(content: &str, line: usize) -> Result<ParsedInstruction> {
         "lte" => (OpCode::Lte, "lte", 3),
         "jump" => (OpCode::Jump, "jump", 1),
         "jumpif" => (OpCode::JumpIf, "jumpif", 2),
+        "call" => (OpCode::Call, "call", 3),
+        "ret" => (OpCode::Ret, "ret", 2),
         "move" => (OpCode::Move, "move", 2),
         "push" => (OpCode::Push, "push", 1),
         "pop" => (OpCode::Pop, "pop", 1),
@@ -286,6 +288,15 @@ fn validate_instruction(parsed: &ParsedInstruction) -> Result<()> {
                 validate_writable_register(*reg, parsed.line)?;
             }
         }
+        OpCode::Call => {
+            validate_call_target(parsed.operands.first().expect("validated arity"), parsed.line)?;
+            validate_frame_size_immediate(parsed.operands.get(1).expect("validated arity"), parsed.line)?;
+            validate_frame_size_immediate(parsed.operands.get(2).expect("validated arity"), parsed.line)?;
+        }
+        OpCode::Ret => {
+            validate_frame_size_immediate(parsed.operands.first().expect("validated arity"), parsed.line)?;
+            validate_frame_size_immediate(parsed.operands.get(1).expect("validated arity"), parsed.line)?;
+        }
         OpCode::Pop => match parsed.operands.first().expect("validated arity") {
             OperandToken::Register(reg) => validate_writable_register(*reg, parsed.line)?,
             _ => bail!("line {}: destination operand must be a register", parsed.line),
@@ -315,7 +326,8 @@ fn lower_operand(
     labels: &HashMap<String, usize>,
 ) -> Result<Operand> {
     let is_jump_target = (parsed.opcode == OpCode::Jump && idx == 0)
-        || (parsed.opcode == OpCode::JumpIf && idx == 1);
+        || (parsed.opcode == OpCode::JumpIf && idx == 1)
+        || (parsed.opcode == OpCode::Call && idx == 0);
 
     if is_jump_target {
         return match token {
@@ -361,6 +373,23 @@ fn validate_writable_register(reg: u64, line: usize) -> Result<()> {
     }
 }
 
+fn validate_call_target(target: &OperandToken, line: usize) -> Result<()> {
+    match target {
+        OperandToken::Immediate(_) | OperandToken::Label(_) => Ok(()),
+        _ => bail!("line {line}: call target must be an immediate address or label"),
+    }
+}
+
+fn validate_frame_size_immediate(operand: &OperandToken, line: usize) -> Result<()> {
+    match operand {
+        OperandToken::Immediate(value) if value % 8 == 0 => Ok(()),
+        OperandToken::Immediate(value) => bail!(
+            "line {line}: frame size operands must be multiples of 8 bytes, got {value}"
+        ),
+        _ => bail!("line {line}: frame size operands must be immediate byte counts"),
+    }
+}
+
 fn build_target_labels(program: &[Instruction]) -> BTreeMap<usize, String> {
     let mut labels = BTreeMap::<usize, String>::new();
     for instruction in program {
@@ -376,6 +405,15 @@ fn build_target_labels(program: &[Instruction]) -> BTreeMap<usize, String> {
             }
             OpCode::JumpIf => {
                 if let Operand::Immediate(target) = instruction.operands[1] {
+                    if (target as usize) < program.len() {
+                        labels
+                            .entry(target as usize)
+                            .or_insert_with(|| format!("L{target}"));
+                    }
+                }
+            }
+            OpCode::Call => {
+                if let Operand::Immediate(target) = instruction.operands[0] {
                     if (target as usize) < program.len() {
                         labels
                             .entry(target as usize)
@@ -450,6 +488,17 @@ fn format_instruction(instruction: Instruction, labels: &BTreeMap<usize, String>
             "jumpif {}, {}",
             format_operand(instruction.operands[0]),
             format_jump_target(instruction.operands[1], labels)
+        ),
+        OpCode::Call => format!(
+            "call {}, {}, {}",
+            format_jump_target(instruction.operands[0], labels),
+            format_operand(instruction.operands[1]),
+            format_operand(instruction.operands[2])
+        ),
+        OpCode::Ret => format!(
+            "ret {}, {}",
+            format_operand(instruction.operands[0]),
+            format_operand(instruction.operands[1])
         ),
         OpCode::Move => format!(
             "move {}, {}",
@@ -704,6 +753,25 @@ entry:
     }
 
     #[test]
+    fn assemble_supports_call_and_ret() {
+        let src = r#"
+entry:
+    call fib, 8, 8
+fib:
+    ret 8, 8
+"#;
+        let program = assemble_program(src).expect("assembly should parse");
+
+        assert_eq!(program[0].opcode, OpCode::Call);
+        assert_eq!(program[0].operands[0], Operand::Immediate(1));
+        assert_eq!(program[0].operands[1], Operand::Immediate(8));
+        assert_eq!(program[0].operands[2], Operand::Immediate(8));
+        assert_eq!(program[1].opcode, OpCode::Ret);
+        assert_eq!(program[1].operands[0], Operand::Immediate(8));
+        assert_eq!(program[1].operands[1], Operand::Immediate(8));
+    }
+
+    #[test]
     fn assemble_rejects_invalid_memory_usage() {
         let error = assemble_program("move [r0], [r1]").expect_err("should fail");
         assert!(error.to_string().contains("memory-to-memory"));
@@ -722,6 +790,20 @@ entry:
 
         let error = assemble_program("move r20, 1").expect_err("should fail");
         assert!(error.to_string().contains("reserved register `r20`"));
+    }
+
+    #[test]
+    fn assemble_rejects_invalid_call_and_ret_operands() {
+        let error = assemble_program("call r0, 8, 8").expect_err("should fail");
+        assert!(error.to_string().contains("call target must be an immediate address or label"));
+
+        let error = assemble_program("call fib, r0, 8").expect_err("should fail");
+        assert!(error.to_string().contains("frame size operands must be immediate byte counts"));
+
+        let error = assemble_program("ret 4, 8").expect_err("should fail");
+        assert!(error
+            .to_string()
+            .contains("frame size operands must be multiples of 8 bytes"));
     }
 
     #[test]
@@ -754,6 +836,35 @@ entry:
     }
 
     #[test]
+    fn disassemble_emits_labels_for_call_targets() {
+        let program = vec![
+            Instruction {
+                opcode: OpCode::Call,
+                operands: [
+                    Operand::Immediate(1),
+                    Operand::Immediate(8),
+                    Operand::Immediate(8),
+                    Operand::Register(0),
+                ],
+            },
+            Instruction {
+                opcode: OpCode::Ret,
+                operands: [
+                    Operand::Immediate(8),
+                    Operand::Immediate(8),
+                    Operand::Register(0),
+                    Operand::Register(0),
+                ],
+            },
+        ];
+
+        let text = disassemble_program(&program);
+        assert!(text.contains("call L1, 8, 8"));
+        assert!(text.contains("L1:"));
+        assert!(text.contains("ret 8, 8"));
+    }
+
+    #[test]
     fn asm_binary_round_trip() {
         let src = r#"
 loop:
@@ -763,6 +874,9 @@ loop:
     move [bp+8], r0
     push 7
     pop bp
+    call done, 8, 8
+done:
+    ret 8, 8
     halt
 "#;
 
@@ -774,5 +888,7 @@ loop:
         let disassembled = disassemble_program(&decoded);
         assert!(disassembled.contains("L0:"));
         assert!(disassembled.contains("move [bp+8], r0"));
+        assert!(disassembled.contains("call"));
+        assert!(disassembled.contains("ret 8, 8"));
     }
 }
